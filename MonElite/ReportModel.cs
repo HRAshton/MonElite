@@ -8,10 +8,12 @@ namespace MonElite
 
         public Dictionary<string, ulong> UsersSpaceBytes { get; set; } = new Dictionary<string, ulong>();
 
-        public List<string> InstalledApps { get; set; } = new List<string>();
+        public List<string> Apps { get; set; } = new List<string>();
 
         public string MachineId { get; set; } = "";
 
         public List<string> Users { get; set; } = new List<string>();
+
+        public List<string[]> Policies { get; set; } = new List<string[]>();
     }
 }

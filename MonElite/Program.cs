@@ -6,6 +6,7 @@ using System.IO.Filesystem.Ntfs;
 using System.Linq;
 using System.Net.Http;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 
 namespace MonElite
@@ -25,29 +26,36 @@ namespace MonElite
             {
                 case "d":
                 case "space-disk":
-                    sendingModel.DisksSpaceBytes = GetUsedSpacePerDrive();
+                    sendingModel.DisksSpaceBytes = GetUsedSpacePerDriveAsync().Result;
                     break;
 
                 case "u":
                 case "space-user":
-                    sendingModel.UsersSpaceBytes = GetUserProfileFoldersSizes();
+                    sendingModel.UsersSpaceBytes = GetUserProfileFoldersSizesAsync().Result;
                     break;
 
                 case "i":
                 case "installed-apps":
-                    sendingModel.InstalledApps = GetInstalledApps();
+                    sendingModel.Apps = GetAppsAsync().Result;
                     break;
 
                 case "l":
                 case "users-list":
-                    sendingModel.Users = GetUsers();
+                    sendingModel.Users = GetUsersAsync().Result;
                     break;
 
                 case "all":
-                    sendingModel.Users = GetUsers();
-                    sendingModel.InstalledApps = GetInstalledApps();
-                    sendingModel.DisksSpaceBytes = GetUsedSpacePerDrive();
-                    sendingModel.UsersSpaceBytes = GetUserProfileFoldersSizes();
+                    Task<List<string>> appsTask = GetAppsAsync();
+                    Task<List<string>> usersTask = GetUsersAsync();
+                    Task<List<string[]>> policiesTask = GetLocalGroupPoliciesAsync();
+                    Task<Dictionary<string, long[]>> drivesTask = GetUsedSpacePerDriveAsync();
+                    Task<Dictionary<string, ulong>> usersFoldersTask = GetUserProfileFoldersSizesAsync();
+
+                    //sendingModel.Apps = appsTask.Result;
+                    //sendingModel.Users = usersTask.Result;
+                    sendingModel.Policies = policiesTask.Result;
+                    //sendingModel.DisksSpaceBytes = drivesTask.Result;
+                    //sendingModel.UsersSpaceBytes = usersFoldersTask.Result;
 
                     break;
 
@@ -58,15 +66,15 @@ namespace MonElite
 
             Console.WriteLine($"Sending {mode} report...");
             SendReport(sendingModel);
-            
+
             Console.WriteLine("Sent.");
         }
 
-        private static List<string> GetUsers()
+        private async static Task<List<string>> GetUsersAsync()
         {
-            var output = StartProcessAndReadOutput("net", "users");
+            var output = await StartProcessAndReadOutputAsync("net", "users");
 
-            var usernames = Regex.Match(output, @"\-\r\n(.*?)The command completed successfully.",
+            var usernames = Regex.Match(output, @"\-{10}\r{0,1}\n(.*?)\r{0,1}\n([а-яА-Я\w ]+)\.",
                     RegexOptions.Singleline)
                 .Groups[1].Value
                 .Split(new[] { ' ', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
@@ -79,13 +87,16 @@ namespace MonElite
         {
             var compiledReport = JsonConvert.SerializeObject(sendingModel);
 
+            Console.WriteLine("Report content: " + compiledReport);
             var httpClient = new HttpClient();
-            var t = httpClient.PostAsync(
-                "https://script.google.com/macros/s/AKfycbwIl7ZDB3v8RxYjc4gzna2lwuWhf9YEb3OqeJRG8w0AqdYcbg/exec",
-                new StringContent(compiledReport)).Result.Content.ReadAsStringAsync().Result;
+            var response = httpClient.PostAsync(
+                "https://script.google.com/macros/s/AKfycbwIl7ZDB3v8RxYjc4gz-na2lwuWhf9YEb3OqeJRG8w0AqdYcbg/exec",
+                new StringContent(compiledReport))
+                .Result.Content.ReadAsStringAsync().Result;
+            Console.WriteLine("Response: " + response);
         }
 
-        private static List<string> GetInstalledApps()
+        private async static Task<List<string>> GetAppsAsync()
         {
             var specialMessageWords = new[]
             {
@@ -93,48 +104,83 @@ namespace MonElite
                 "packages installed.", "not managed with Chocolatey.", "success", "It is recommended that you",
                 "Did you know Pro", "Learn more about", "https://chocolatey.org/compare"
             };
-            
-            var output = StartProcessAndReadOutput("choco", "list -li");
+
+            var output = await StartProcessAndReadOutputAsync("choco", "list -li");
 
             var installedApps = output
                 .Split("\r\n")
                 .Where(line => line.Length > 1 && !specialMessageWords.Any(line.Contains))
+                .OrderBy(x => x)
                 .ToList();
 
             return installedApps;
         }
 
-        private static Dictionary<string, long[]> GetUsedSpacePerDrive()
+        private async static Task<Dictionary<string, long[]>> GetUsedSpacePerDriveAsync()
         {
-            var result = DriveInfo.GetDrives()
-                .Where(x => x.IsReady)
-                .ToDictionary(x => x.Name, x => new[] { x.AvailableFreeSpace, x.TotalSize });
+            return await Task.Run(() =>
+            {
+                var result = DriveInfo.GetDrives()
+                    .Where(x => x.IsReady && x.DriveType == DriveType.Fixed)
+                    .OrderBy(x => x.Name)
+                    .ToDictionary(x => x.Name.Substring(0, 1), x => new[] { x.AvailableFreeSpace, x.TotalSize });
 
-            return result;
+                return result;
+            });
         }
 
-        private static Dictionary<string, ulong> GetUserProfileFoldersSizes(string usersPath = "C:\\Users")
+        private async static Task<Dictionary<string, ulong>> GetUserProfileFoldersSizesAsync(string usersPath = "C:\\Users")
         {
-            var driveToAnalyze = new DriveInfo(Path.GetPathRoot(usersPath));
-            var trimmedUserPath = usersPath.Replace('/', '\\').Trim('"', '\\');
-
-            Dictionary<string, ulong> nodes;
-            using (var ntfsReader = new NtfsReader(driveToAnalyze, RetrieveMode.Minimal))
+            return await Task.Run(() =>
             {
-                nodes = ntfsReader.GetNodes(usersPath)
-                    .Skip(1)
-                    .AsParallel()
-                    .Where(node => (node.Attributes & Attributes.Directory) == 0)
-                    .ToLookup(x => x.FullName
-                        .Substring(trimmedUserPath.Length)
-                        .Split('\\', StringSplitOptions.RemoveEmptyEntries)
-                        .FirstOrDefault() ?? ".")
-                    .ToDictionary(
-                        x => x.Key,
-                        x => x.Aggregate<INode, ulong>(0, (a, c) => a + c.Size));
-            }
+                var driveToAnalyze = new DriveInfo(Path.GetPathRoot(usersPath));
+                var trimmedUserPath = usersPath.Replace('/', '\\').Trim('"', '\\');
 
-            return nodes;
+                Dictionary<string, ulong> nodes;
+                using (var ntfsReader = new NtfsReader(driveToAnalyze, RetrieveMode.Minimal))
+                {
+                    nodes = ntfsReader.GetNodes(usersPath)
+                        .AsParallel()
+                        .Where(node => (node.Attributes & Attributes.Directory) == 0)
+                        .ToLookup(x => x.FullName
+                            .Substring(trimmedUserPath.Length)
+                            .Split('\\')
+                            .ElementAtOrDefault(1) ?? ".")
+                        .Where(x => !x.Key.Contains(".LOG", StringComparison.OrdinalIgnoreCase))
+                        .OrderBy(x => x.Key)
+                        .ToDictionary(
+                            x => x.Key,
+                            x => x.Aggregate<INode, ulong>(0, (a, c) => a + c.Size));
+                }
+
+                return nodes;
+            });
+        }
+
+        private async static Task<List<string[]>> GetLocalGroupPoliciesAsync()
+        {
+            var tempFolder = Directory.CreateDirectory(Path.GetTempPath() + Guid.NewGuid());
+
+            var lgpoOutput = await StartProcessAndReadOutputAsync("lgpo.exe", "/b " + tempFolder.FullName);
+            var polFiles = tempFolder.GetFiles("*.pol", SearchOption.AllDirectories);
+            var outputs = polFiles
+                .Select(file => StartProcessAndReadOutputAsync("lgpo.exe", "/parse /m " + file.FullName).Result)
+                .ToList();
+            var blocks = outputs.SelectMany(output => output.Split(Environment.NewLine + Environment.NewLine));
+            var result = blocks
+                .Select(block => block.Split(Environment.NewLine))
+                .Where(lines => lines.Length == 4)
+                .Select(lines => new[] {
+                    lines[2],
+                    lines[3].Split(":").Last(),
+                    lines[1]
+                })
+                .OrderBy(x => x[2]).ThenBy(x => x[0])
+                .ToList();
+
+            tempFolder.Delete(true);
+
+            return result;
         }
 
         private static void PrintHelp()
@@ -149,23 +195,26 @@ namespace MonElite
         }
 
 
-        private static string StartProcessAndReadOutput(string path, string args)
+        private async static Task<string> StartProcessAndReadOutputAsync(string path, string args)
         {
-            var p = new Process
+            return await Task.Run(() =>
             {
-                StartInfo =
+                var p = new Process
+                {
+                    StartInfo =
                 {
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     FileName = path,
                     Arguments = args
                 }
-            };
-            p.Start();
-            var output = p.StandardOutput.ReadToEnd();
-            p.WaitForExit();
+                };
+                p.Start();
+                var output = p.StandardOutput.ReadToEnd();
+                p.WaitForExit();
 
-            return output;
+                return output;
+            });
         }
     }
 }
